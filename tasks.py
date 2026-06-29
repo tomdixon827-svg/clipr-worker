@@ -17,15 +17,21 @@ def run_cmd(cmd):
 def upload_file(file_path: str) -> str:
     with open(file_path, 'rb') as f:
         data = f.read()
+    boundary = 'boundary123456'
+    body = (
+        f'--{boundary}\r\n'
+        f'Content-Disposition: form-data; name="file"; filename="output.mp4"\r\n'
+        f'Content-Type: video/mp4\r\n\r\n'
+    ).encode() + data + f'\r\n--{boundary}--\r\n'.encode()
     req = urllib.request.Request(
-        'https://store1.gofile.io/uploadFile',
-        data=data,
+        'https://file.io/?expires=1d',
+        data=body,
         method='POST'
     )
-    req.add_header('Content-Type', 'application/octet-stream')
+    req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
     with urllib.request.urlopen(req) as resp:
         result = json.loads(resp.read())
-    return result['data']['downloadPage']
+    return result['link']
 
 @celery_app.task(name="tasks.process_youtube")
 def process_youtube(job_id, payload):
