@@ -23,7 +23,7 @@ def process_youtube(job_id, payload):
 
         import yt_dlp
         opts = {
-          "format": "best[ext=mp4]/best",
+          "format": "bestvideo+bestaudio/best",
 
             "outtmpl": f"{out_dir}/source.%(ext)s",
             "merge_output_format": "mp4",
