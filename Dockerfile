@@ -1,7 +1,7 @@
 FROM python:3.11-slim
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ffmpeg git && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-RUN pip install --no-cache-dir setuptools wheel
+RUN pip install --no-cache-dir "setuptools<70" wheel
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
