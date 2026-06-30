@@ -14,20 +14,19 @@ def run_cmd(cmd):
     if result.returncode != 0:
         raise RuntimeError(result.stderr[-500:])
 
-def upload_file(file_path):
+def upload_file(job_id, file_path):
     import urllib.request
+    api_url = "https://clipr-api-production-a3cf.up.railway.app/api/internal/store/" + job_id
     with open(file_path, 'rb') as f:
         data = f.read()
     boundary = 'boundary123456'
     body = ('--' + boundary + '\r\n' +
             'Content-Disposition: form-data; name="file"; filename="output.mp4"\r\n' +
             'Content-Type: video/mp4\r\n\r\n').encode() + data + ('\r\n--' + boundary + '--\r\n').encode()
-    req = urllib.request.Request('https://tmpfiles.org/api/v1/upload', data=body, method='POST')
+    req = urllib.request.Request(api_url, data=body, method='POST')
     req.add_header('Content-Type', 'multipart/form-data; boundary=' + boundary)
-    with urllib.request.urlopen(req) as resp:
-        result = json.loads(resp.read())
-    url = result['data']['url']
-    return url.replace('tmpfiles.org/', 'tmpfiles.org/dl/')
+    urllib.request.urlopen(req)
+    return "https://clipr-api-production-a3cf.up.railway.app/api/clips/" + job_id + "/download"
 
 @celery_app.task(name="tasks.process_upload")
 def process_upload(job_id, file_b64):
@@ -44,7 +43,7 @@ def process_upload(job_id, file_b64):
         output_path = process_video(job_id, video_path)
         print("FFMPEG DONE", flush=True)
         publish(job_id, {"status": "uploading", "progress": 85})
-        download_url = upload_file(output_path)
+        download_url = upload_file(job_id, output_path)
         print("UPLOADED:", download_url, flush=True)
         publish(job_id, {"status": "complete", "progress": 100, "download_url": download_url})
     except Exception as e:
