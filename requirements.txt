@@ -1,3 +1,4 @@
 celery[redis]==5.3.6
 redis==5.0.3
-yt-dlp
+openai-whisper==20231117
+torch==2.2.1
