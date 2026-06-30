@@ -7,6 +7,14 @@ celery_app = Celery("clipr", broker=REDIS_URL, backend=REDIS_URL)
 r = redis.from_url(REDIS_URL)
 API_BASE = "https://clipr-api-production-a3cf.up.railway.app"
 
+_whisper_model = None
+def get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        import whisper
+        _whisper_model = whisper.load_model("tiny")
+    return _whisper_model
+
 def publish(job_id, data):
     r.set(f"job:{job_id}", json.dumps(data), ex=3600)
 
@@ -37,7 +45,7 @@ def upload_file(job_id, file_path):
 # ============== CLIP EXPORT ==============
 
 @celery_app.task(name="tasks.process_upload")
-def process_upload(job_id, file_b64, clip_start=0, clip_end=0):
+def process_upload(job_id, file_b64, clip_start=0, clip_end=0, captions=False):
     try:
         publish(job_id, {"status": "processing", "progress": 30})
         out_dir = "/tmp/" + job_id
@@ -45,25 +53,97 @@ def process_upload(job_id, file_b64, clip_start=0, clip_end=0):
         video_path = out_dir + "/source.mp4"
         with open(video_path, "wb") as f:
             f.write(base64.b64decode(file_b64))
-        publish(job_id, {"status": "processing", "progress": 50})
-        output_path = process_video(job_id, video_path, clip_start, clip_end)
-        publish(job_id, {"status": "uploading", "progress": 85})
+
+        publish(job_id, {"status": "processing", "progress": 45})
+        trimmed_path = trim_clip(job_id, video_path, clip_start, clip_end)
+
+        srt_path = None
+        if captions:
+            publish(job_id, {"status": "processing", "progress": 60, "message": "Generating captions..."})
+            srt_path = generate_captions(job_id, trimmed_path)
+
+        publish(job_id, {"status": "processing", "progress": 75})
+        output_path = render_final(job_id, trimmed_path, srt_path)
+
+        publish(job_id, {"status": "uploading", "progress": 90})
         download_url = upload_file(job_id, output_path)
         publish(job_id, {"status": "complete", "progress": 100, "download_url": download_url})
     except Exception as e:
         publish(job_id, {"status": "failed", "error": str(e), "progress": 0})
 
-def process_video(job_id, video_path, clip_start=0, clip_end=0):
+
+def trim_clip(job_id, video_path, clip_start, clip_end):
+    """Trim to the selected range first (fast, no re-render of full video for captioning)."""
     out_dir = "/tmp/" + job_id
-    output_path = out_dir + "/output.mp4"
-    vf = "crop=ih*9/16:ih,scale=1080:1920"
+    trimmed_path = out_dir + "/trimmed.mp4"
     cmd = ["ffmpeg", "-y"]
     if clip_start:
         cmd += ["-ss", str(clip_start)]
     cmd += ["-i", video_path]
     if clip_end and clip_end > clip_start:
         cmd += ["-t", str(clip_end - clip_start)]
-    cmd += [
+    cmd += ["-c", "copy", trimmed_path]
+    try:
+        run_cmd(cmd)
+    except RuntimeError:
+        # stream copy can fail on some containers - fall back to re-encode trim
+        cmd = ["ffmpeg", "-y"]
+        if clip_start:
+            cmd += ["-ss", str(clip_start)]
+        cmd += ["-i", video_path]
+        if clip_end and clip_end > clip_start:
+            cmd += ["-t", str(clip_end - clip_start)]
+        cmd += ["-c:v", "libx264", "-preset", "fast", "-c:a", "aac", trimmed_path]
+        run_cmd(cmd)
+    return trimmed_path
+
+
+def generate_captions(job_id, trimmed_path):
+    """Transcribe the trimmed clip and write an SRT file with word-level pacing."""
+    out_dir = "/tmp/" + job_id
+    audio_path = out_dir + "/clip_audio.wav"
+    run_cmd(["ffmpeg", "-y", "-i", trimmed_path, "-ar", "16000", "-ac", "1", audio_path])
+
+    model = get_whisper_model()
+    result = model.transcribe(audio_path, fp16=False, verbose=False)
+    segments = result.get("segments", [])
+
+    if not segments:
+        return None
+
+    srt_path = out_dir + "/captions.srt"
+    with open(srt_path, "w") as f:
+        for i, seg in enumerate(segments, start=1):
+            start = format_srt_time(seg["start"])
+            end = format_srt_time(seg["end"])
+            text = seg["text"].strip()
+            f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
+    return srt_path
+
+
+def format_srt_time(seconds):
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds - int(seconds)) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def render_final(job_id, trimmed_path, srt_path):
+    """Crop to 9:16 and optionally burn in captions, in one pass."""
+    out_dir = "/tmp/" + job_id
+    output_path = out_dir + "/output.mp4"
+
+    vf_parts = ["crop=ih*9/16:ih", "scale=1080:1920"]
+    if srt_path:
+        style = "FontName=Arial,FontSize=20,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2,MarginV=80"
+        escaped_path = srt_path.replace(":", "\\:")
+        vf_parts.append(f"subtitles={escaped_path}:force_style='{style}'")
+    vf = ",".join(vf_parts)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", trimmed_path,
         "-vf", vf,
         "-c:v", "libx264",
         "-preset", "fast",
@@ -95,8 +175,7 @@ def analyze_video(job_id, file_b64):
 
         publish_analysis(job_id, {"status": "processing", "message": "Transcribing speech..."})
 
-        import whisper
-        model = whisper.load_model("tiny")
+        model = get_whisper_model()
         result = model.transcribe(audio_path, fp16=False, verbose=False)
         segments = result.get("segments", [])
 
@@ -118,8 +197,6 @@ def analyze_video(job_id, file_b64):
 
 
 def build_candidates(segments):
-    """Group whisper segments into 8-45s chunks at natural sentence boundaries,
-    score by speech density and presence of strong keywords."""
     HOOK_WORDS = ["never", "secret", "wrong", "mistake", "biggest", "best", "worst",
                   "shocking", "amazing", "stop", "wait", "actually", "truth", "nobody",
                   "everyone", "always", "incredible", "insane", "crazy", "important"]
