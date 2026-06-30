@@ -29,7 +29,7 @@ def upload_file(job_id, file_path):
     return "https://clipr-api-production-a3cf.up.railway.app/api/clips/" + job_id + "/download"
 
 @celery_app.task(name="tasks.process_upload")
-def process_upload(job_id, file_b64):
+def process_upload(job_id, file_b64, clip_start=0, clip_end=0):
     print("STARTING JOB", job_id, flush=True)
     try:
         publish(job_id, {"status": "processing", "progress": 30})
@@ -40,7 +40,7 @@ def process_upload(job_id, file_b64):
             f.write(base64.b64decode(file_b64))
         print("FILE WRITTEN", flush=True)
         publish(job_id, {"status": "processing", "progress": 50})
-        output_path = process_video(job_id, video_path)
+        output_path = process_video(job_id, video_path, clip_start, clip_end)
         print("FFMPEG DONE", flush=True)
         publish(job_id, {"status": "uploading", "progress": 85})
         download_url = upload_file(job_id, output_path)
@@ -50,13 +50,17 @@ def process_upload(job_id, file_b64):
         print("ERROR:", str(e), flush=True)
         publish(job_id, {"status": "failed", "error": str(e), "progress": 0})
 
-def process_video(job_id, video_path):
+def process_video(job_id, video_path, clip_start=0, clip_end=0):
     out_dir = "/tmp/" + job_id
     output_path = out_dir + "/output.mp4"
     vf = "crop=ih*9/16:ih,scale=1080:1920"
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", video_path,
+    cmd = ["ffmpeg", "-y"]
+    if clip_start:
+        cmd += ["-ss", str(clip_start)]
+    cmd += ["-i", video_path]
+    if clip_end and clip_end > clip_start:
+        cmd += ["-t", str(clip_end - clip_start)]
+    cmd += [
         "-vf", vf,
         "-c:v", "libx264",
         "-preset", "fast",
