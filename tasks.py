@@ -30,19 +30,25 @@ def upload_file(file_path):
 
 @celery_app.task(name="tasks.process_upload")
 def process_upload(job_id, file_b64):
+    print("STARTING JOB", job_id, flush=True)
     try:
         publish(job_id, {"status": "processing", "progress": 30})
+        print("PUBLISHED STATUS 1", flush=True)
         out_dir = "/tmp/" + job_id
         os.makedirs(out_dir, exist_ok=True)
         video_path = out_dir + "/source.mp4"
         with open(video_path, "wb") as f:
             f.write(base64.b64decode(file_b64))
+        print("FILE WRITTEN", flush=True)
         publish(job_id, {"status": "processing", "progress": 50})
         output_path = process_video(job_id, video_path)
+        print("FFMPEG DONE", flush=True)
         publish(job_id, {"status": "uploading", "progress": 85})
         download_url = upload_file(output_path)
+        print("UPLOADED", flush=True)
         publish(job_id, {"status": "complete", "progress": 100, "download_url": download_url})
     except Exception as e:
+        print("ERROR:", str(e), flush=True)
         publish(job_id, {"status": "failed", "error": str(e), "progress": 0})
 
 def process_video(job_id, video_path):
