@@ -12,7 +12,9 @@ def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
         import whisper
+        print("Loading whisper model (first use this container)...", flush=True)
         _whisper_model = whisper.load_model("tiny")
+        print("Whisper model loaded and cached", flush=True)
     return _whisper_model
 
 def publish(job_id, data):
@@ -46,6 +48,7 @@ def upload_file(job_id, file_path):
 
 @celery_app.task(name="tasks.process_upload")
 def process_upload(job_id, file_b64, clip_start=0, clip_end=0, captions=False):
+    print("EXPORT START", job_id, "captions=", captions, flush=True)
     try:
         publish(job_id, {"status": "processing", "progress": 30})
         out_dir = "/tmp/" + job_id
@@ -53,22 +56,29 @@ def process_upload(job_id, file_b64, clip_start=0, clip_end=0, captions=False):
         video_path = out_dir + "/source.mp4"
         with open(video_path, "wb") as f:
             f.write(base64.b64decode(file_b64))
+        print("FILE WRITTEN", flush=True)
 
         publish(job_id, {"status": "processing", "progress": 45})
         trimmed_path = trim_clip(job_id, video_path, clip_start, clip_end)
+        print("TRIMMED", flush=True)
 
         srt_path = None
         if captions:
             publish(job_id, {"status": "processing", "progress": 60, "message": "Generating captions..."})
+            print("CAPTIONS: loading model", flush=True)
             srt_path = generate_captions(job_id, trimmed_path)
+            print("CAPTIONS DONE:", srt_path, flush=True)
 
         publish(job_id, {"status": "processing", "progress": 75})
         output_path = render_final(job_id, trimmed_path, srt_path)
+        print("RENDER DONE", flush=True)
 
         publish(job_id, {"status": "uploading", "progress": 90})
         download_url = upload_file(job_id, output_path)
+        print("UPLOADED:", download_url, flush=True)
         publish(job_id, {"status": "complete", "progress": 100, "download_url": download_url})
     except Exception as e:
+        print("EXPORT ERROR:", str(e), flush=True)
         publish(job_id, {"status": "failed", "error": str(e), "progress": 0})
 
 
@@ -105,7 +115,7 @@ def generate_captions(job_id, trimmed_path):
     run_cmd(["ffmpeg", "-y", "-i", trimmed_path, "-ar", "16000", "-ac", "1", audio_path])
 
     model = get_whisper_model()
-    result = model.transcribe(audio_path, fp16=False, verbose=False)
+    result = model.transcribe(audio_path, fp16=False, verbose=False, language="en")
     segments = result.get("segments", [])
 
     if not segments:
@@ -176,7 +186,7 @@ def analyze_video(job_id, file_b64):
         publish_analysis(job_id, {"status": "processing", "message": "Transcribing speech..."})
 
         model = get_whisper_model()
-        result = model.transcribe(audio_path, fp16=False, verbose=False)
+        result = model.transcribe(audio_path, fp16=False, verbose=False, language="en")
         segments = result.get("segments", [])
 
         if not segments:
