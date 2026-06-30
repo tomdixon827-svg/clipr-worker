@@ -1,4 +1,4 @@
-import os, json, subprocess
+import os, json, subprocess, base64
 import redis
 from celery import Celery
 
@@ -29,8 +29,14 @@ def upload_file(file_path):
     return result['link']
 
 @celery_app.task(name="tasks.process_upload")
-def process_upload(job_id, video_path):
+def process_upload(job_id, file_b64):
     try:
+        publish(job_id, {"status": "processing", "progress": 30})
+        out_dir = "/tmp/" + job_id
+        os.makedirs(out_dir, exist_ok=True)
+        video_path = out_dir + "/source.mp4"
+        with open(video_path, "wb") as f:
+            f.write(base64.b64decode(file_b64))
         publish(job_id, {"status": "processing", "progress": 50})
         output_path = process_video(job_id, video_path)
         publish(job_id, {"status": "uploading", "progress": 85})
@@ -41,7 +47,6 @@ def process_upload(job_id, video_path):
 
 def process_video(job_id, video_path):
     out_dir = "/tmp/" + job_id
-    os.makedirs(out_dir, exist_ok=True)
     output_path = out_dir + "/output.mp4"
     vf = "crop=ih*9/16:ih,scale=1080:1920"
     cmd = [
