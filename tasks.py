@@ -22,18 +22,18 @@ def upload_file(file_path):
     body = ('--' + boundary + '\r\n' +
             'Content-Disposition: form-data; name="file"; filename="output.mp4"\r\n' +
             'Content-Type: video/mp4\r\n\r\n').encode() + data + ('\r\n--' + boundary + '--\r\n').encode()
-    req = urllib.request.Request('https://file.io/?expires=1d', data=body, method='POST')
+    req = urllib.request.Request('https://tmpfiles.org/api/v1/upload', data=body, method='POST')
     req.add_header('Content-Type', 'multipart/form-data; boundary=' + boundary)
     with urllib.request.urlopen(req) as resp:
         result = json.loads(resp.read())
-    return result['link']
+    url = result['data']['url']
+    return url.replace('tmpfiles.org/', 'tmpfiles.org/dl/')
 
 @celery_app.task(name="tasks.process_upload")
 def process_upload(job_id, file_b64):
     print("STARTING JOB", job_id, flush=True)
     try:
         publish(job_id, {"status": "processing", "progress": 30})
-        print("PUBLISHED STATUS 1", flush=True)
         out_dir = "/tmp/" + job_id
         os.makedirs(out_dir, exist_ok=True)
         video_path = out_dir + "/source.mp4"
@@ -45,7 +45,7 @@ def process_upload(job_id, file_b64):
         print("FFMPEG DONE", flush=True)
         publish(job_id, {"status": "uploading", "progress": 85})
         download_url = upload_file(output_path)
-        print("UPLOADED", flush=True)
+        print("UPLOADED:", download_url, flush=True)
         publish(job_id, {"status": "complete", "progress": 100, "download_url": download_url})
     except Exception as e:
         print("ERROR:", str(e), flush=True)
