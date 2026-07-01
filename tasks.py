@@ -42,6 +42,8 @@ def transcribe_audio(audio_path):
         f'Content-Disposition: form-data; name="response_format"\r\n\r\nverbose_json\r\n'
         f'--{boundary}\r\n'
         f'Content-Disposition: form-data; name="timestamp_granularities[]"\r\n\r\nword\r\n'
+        f'--{boundary}\r\n'
+        f'Content-Disposition: form-data; name="timestamp_granularities[]"\r\n\r\nsegment\r\n'
         f'--{boundary}--\r\n'
     ).encode()
 
