@@ -22,9 +22,8 @@ def run_cmd(cmd, timeout=600):
     return result
 
 def transcribe_audio(audio_path):
-    """Use OpenAI Whisper API — fast, reliable, no local GPU needed."""
+    """OpenAI Whisper API with word-level timestamps."""
     import urllib.request
-    import json as json_mod
 
     with open(audio_path, 'rb') as f:
         audio_data = f.read()
@@ -36,29 +35,30 @@ def transcribe_audio(audio_path):
         f'Content-Type: audio/wav\r\n\r\n'
     ).encode() + audio_data + (
         f'\r\n--{boundary}\r\n'
-        f'Content-Disposition: form-data; name="model"\r\n\r\n'
-        f'whisper-1\r\n'
+        f'Content-Disposition: form-data; name="model"\r\n\r\nwhisper-1\r\n'
         f'--{boundary}\r\n'
-        f'Content-Disposition: form-data; name="language"\r\n\r\n'
-        f'en\r\n'
+        f'Content-Disposition: form-data; name="language"\r\n\r\nen\r\n'
         f'--{boundary}\r\n'
-        f'Content-Disposition: form-data; name="response_format"\r\n\r\n'
-        f'verbose_json\r\n'
+        f'Content-Disposition: form-data; name="response_format"\r\n\r\nverbose_json\r\n'
+        f'--{boundary}\r\n'
+        f'Content-Disposition: form-data; name="timestamp_granularities[]"\r\n\r\nword\r\n'
         f'--{boundary}--\r\n'
     ).encode()
 
     req = urllib.request.Request(
         'https://api.openai.com/v1/audio/transcriptions',
-        data=body,
-        method='POST'
+        data=body, method='POST'
     )
     req.add_header('Authorization', f'Bearer {OPENAI_API_KEY}')
     req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
 
     with urllib.request.urlopen(req, timeout=120) as resp:
-        result = json_mod.loads(resp.read())
+        result = json.loads(resp.read())
 
-    return result.get('segments', [])
+    # Return word-level entries with start/end times
+    words = result.get('words', [])
+    segments = result.get('segments', [])
+    return words, segments
 
 def upload_file(job_id, file_path):
     import urllib.request
@@ -93,12 +93,22 @@ def process_upload(job_id, file_b64, clip_start=0, clip_end=0, captions=False):
         trimmed_path = trim_clip(job_id, video_path, clip_start, clip_end)
         print("TRIMMED", flush=True)
 
+        words = []
         srt_path = None
         if captions:
             publish(job_id, {"status": "processing", "progress": 60, "message": "Generating captions..."})
             print("CAPTIONS: calling OpenAI Whisper API", flush=True)
-            srt_path = generate_captions(job_id, trimmed_path)
-            print("CAPTIONS DONE:", srt_path, flush=True)
+            audio_path = out_dir + "/clip_audio.wav"
+            run_cmd(["ffmpeg", "-y", "-i", trimmed_path, "-ar", "16000", "-ac", "1", audio_path])
+            words, segments = transcribe_audio(audio_path)
+            srt_path = build_word_srt(out_dir, words)
+            print("CAPTIONS DONE, words:", len(words), flush=True)
+            # Store word timestamps in Redis so the frontend can display/edit them
+            publish(job_id, {
+                "status": "processing", "progress": 70,
+                "words": words,
+                "message": "Rendering..."
+            })
 
         publish(job_id, {"status": "processing", "progress": 75})
         output_path = render_final(job_id, trimmed_path, srt_path)
@@ -107,7 +117,11 @@ def process_upload(job_id, file_b64, clip_start=0, clip_end=0, captions=False):
         publish(job_id, {"status": "uploading", "progress": 90})
         download_url = upload_file(job_id, output_path)
         print("UPLOADED:", download_url, flush=True)
-        publish(job_id, {"status": "complete", "progress": 100, "download_url": download_url})
+        publish(job_id, {
+            "status": "complete", "progress": 100,
+            "download_url": download_url,
+            "words": words
+        })
     except Exception as e:
         print("EXPORT ERROR:", str(e), flush=True)
         publish(job_id, {"status": "failed", "error": str(e), "progress": 0})
@@ -137,23 +151,18 @@ def trim_clip(job_id, video_path, clip_start, clip_end):
     return trimmed_path
 
 
-def generate_captions(job_id, trimmed_path):
-    out_dir = "/tmp/" + job_id
-    audio_path = out_dir + "/clip_audio.wav"
-    run_cmd(["ffmpeg", "-y", "-i", trimmed_path, "-ar", "16000", "-ac", "1", audio_path])
-
-    segments = transcribe_audio(audio_path)
-
-    if not segments:
+def build_word_srt(out_dir, words):
+    """Build an SRT with one word per entry for word-by-word caption display."""
+    if not words:
         return None
-
     srt_path = out_dir + "/captions.srt"
     with open(srt_path, "w") as f:
-        for i, seg in enumerate(segments, start=1):
-            start = format_srt_time(seg["start"])
-            end = format_srt_time(seg["end"])
-            text = seg["text"].strip()
-            f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
+        for i, w in enumerate(words, start=1):
+            start = format_srt_time(w.get("start", 0))
+            end = format_srt_time(w.get("end", w.get("start", 0) + 0.4))
+            text = w.get("word", "").strip()
+            if text:
+                f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
     return srt_path
 
 
@@ -170,7 +179,8 @@ def render_final(job_id, trimmed_path, srt_path):
     output_path = out_dir + "/output.mp4"
     vf_parts = ["crop=ih*9/16:ih", "scale=1080:1920"]
     if srt_path:
-        style = "FontName=Arial,FontSize=20,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2,MarginV=80"
+        # Bold white text, black outline, positioned 2/3 down (MarginV from bottom)
+        style = "FontName=Arial,FontSize=28,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=1,Alignment=2,MarginV=600"
         escaped_path = srt_path.replace(":", "\\:")
         vf_parts.append(f"subtitles={escaped_path}:force_style='{style}'")
     vf = ",".join(vf_parts)
@@ -178,11 +188,8 @@ def render_final(job_id, trimmed_path, srt_path):
         "ffmpeg", "-y",
         "-i", trimmed_path,
         "-vf", vf,
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "23",
-        "-c:a", "aac",
-        "-b:a", "128k",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
         output_path,
     ]
@@ -206,7 +213,7 @@ def analyze_video(job_id, file_b64):
         run_cmd(["ffmpeg", "-y", "-i", video_path, "-ar", "16000", "-ac", "1", "-t", "600", audio_path])
 
         publish_analysis(job_id, {"status": "processing", "message": "Transcribing speech..."})
-        segments = transcribe_audio(audio_path)
+        words, segments = transcribe_audio(audio_path)
 
         if not segments:
             publish_analysis(job_id, {"status": "complete", "highlights": []})
