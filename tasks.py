@@ -3,19 +3,11 @@ import redis
 from celery import Celery
 
 REDIS_URL = os.environ["REDIS_URL"]
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+
 celery_app = Celery("clipr", broker=REDIS_URL, backend=REDIS_URL)
 r = redis.from_url(REDIS_URL)
 API_BASE = "https://clipr-api-production-a3cf.up.railway.app"
-
-_whisper_model = None
-def get_whisper_model():
-    global _whisper_model
-    if _whisper_model is None:
-        import whisper
-        print("Loading whisper model (first use this container)...", flush=True)
-        _whisper_model = whisper.load_model("tiny")
-        print("Whisper model loaded and cached", flush=True)
-    return _whisper_model
 
 def publish(job_id, data):
     r.set(f"job:{job_id}", json.dumps(data), ex=3600)
@@ -28,6 +20,45 @@ def run_cmd(cmd, timeout=600):
     if result.returncode != 0:
         raise RuntimeError(result.stderr[-500:])
     return result
+
+def transcribe_audio(audio_path):
+    """Use OpenAI Whisper API — fast, reliable, no local GPU needed."""
+    import urllib.request
+    import json as json_mod
+
+    with open(audio_path, 'rb') as f:
+        audio_data = f.read()
+
+    boundary = 'whisper_boundary_abc123'
+    body = (
+        f'--{boundary}\r\n'
+        f'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
+        f'Content-Type: audio/wav\r\n\r\n'
+    ).encode() + audio_data + (
+        f'\r\n--{boundary}\r\n'
+        f'Content-Disposition: form-data; name="model"\r\n\r\n'
+        f'whisper-1\r\n'
+        f'--{boundary}\r\n'
+        f'Content-Disposition: form-data; name="language"\r\n\r\n'
+        f'en\r\n'
+        f'--{boundary}\r\n'
+        f'Content-Disposition: form-data; name="response_format"\r\n\r\n'
+        f'verbose_json\r\n'
+        f'--{boundary}--\r\n'
+    ).encode()
+
+    req = urllib.request.Request(
+        'https://api.openai.com/v1/audio/transcriptions',
+        data=body,
+        method='POST'
+    )
+    req.add_header('Authorization', f'Bearer {OPENAI_API_KEY}')
+    req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
+
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        result = json_mod.loads(resp.read())
+
+    return result.get('segments', [])
 
 def upload_file(job_id, file_path):
     import urllib.request
@@ -65,7 +96,7 @@ def process_upload(job_id, file_b64, clip_start=0, clip_end=0, captions=False):
         srt_path = None
         if captions:
             publish(job_id, {"status": "processing", "progress": 60, "message": "Generating captions..."})
-            print("CAPTIONS: loading model", flush=True)
+            print("CAPTIONS: calling OpenAI Whisper API", flush=True)
             srt_path = generate_captions(job_id, trimmed_path)
             print("CAPTIONS DONE:", srt_path, flush=True)
 
@@ -83,7 +114,6 @@ def process_upload(job_id, file_b64, clip_start=0, clip_end=0, captions=False):
 
 
 def trim_clip(job_id, video_path, clip_start, clip_end):
-    """Trim to the selected range first (fast, no re-render of full video for captioning)."""
     out_dir = "/tmp/" + job_id
     trimmed_path = out_dir + "/trimmed.mp4"
     cmd = ["ffmpeg", "-y"]
@@ -96,7 +126,6 @@ def trim_clip(job_id, video_path, clip_start, clip_end):
     try:
         run_cmd(cmd)
     except RuntimeError:
-        # stream copy can fail on some containers - fall back to re-encode trim
         cmd = ["ffmpeg", "-y"]
         if clip_start:
             cmd += ["-ss", str(clip_start)]
@@ -109,14 +138,11 @@ def trim_clip(job_id, video_path, clip_start, clip_end):
 
 
 def generate_captions(job_id, trimmed_path):
-    """Transcribe the trimmed clip and write an SRT file with word-level pacing."""
     out_dir = "/tmp/" + job_id
     audio_path = out_dir + "/clip_audio.wav"
     run_cmd(["ffmpeg", "-y", "-i", trimmed_path, "-ar", "16000", "-ac", "1", audio_path])
 
-    model = get_whisper_model()
-    result = model.transcribe(audio_path, fp16=False, verbose=False, language="en")
-    segments = result.get("segments", [])
+    segments = transcribe_audio(audio_path)
 
     if not segments:
         return None
@@ -140,17 +166,14 @@ def format_srt_time(seconds):
 
 
 def render_final(job_id, trimmed_path, srt_path):
-    """Crop to 9:16 and optionally burn in captions, in one pass."""
     out_dir = "/tmp/" + job_id
     output_path = out_dir + "/output.mp4"
-
     vf_parts = ["crop=ih*9/16:ih", "scale=1080:1920"]
     if srt_path:
         style = "FontName=Arial,FontSize=20,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2,MarginV=80"
         escaped_path = srt_path.replace(":", "\\:")
         vf_parts.append(f"subtitles={escaped_path}:force_style='{style}'")
     vf = ",".join(vf_parts)
-
     cmd = [
         "ffmpeg", "-y",
         "-i", trimmed_path,
@@ -179,22 +202,17 @@ def analyze_video(job_id, file_b64):
             f.write(base64.b64decode(file_b64))
 
         publish_analysis(job_id, {"status": "processing", "message": "Extracting audio..."})
-
         audio_path = out_dir + "/audio.wav"
         run_cmd(["ffmpeg", "-y", "-i", video_path, "-ar", "16000", "-ac", "1", "-t", "600", audio_path])
 
         publish_analysis(job_id, {"status": "processing", "message": "Transcribing speech..."})
-
-        model = get_whisper_model()
-        result = model.transcribe(audio_path, fp16=False, verbose=False, language="en")
-        segments = result.get("segments", [])
+        segments = transcribe_audio(audio_path)
 
         if not segments:
             publish_analysis(job_id, {"status": "complete", "highlights": []})
             return
 
         publish_analysis(job_id, {"status": "processing", "message": "Scoring moments..."})
-
         candidates = build_candidates(segments)
         candidates.sort(key=lambda c: c["score"], reverse=True)
         top = candidates[:4]
@@ -220,7 +238,6 @@ def build_candidates(segments):
             chunk_start = seg["start"]
         chunk.append(seg)
         duration = seg["end"] - chunk_start
-
         text_so_far = " ".join(s["text"] for s in chunk)
         ends_sentence = seg["text"].strip().endswith((".", "!", "?"))
 
@@ -242,14 +259,10 @@ def score_chunk(start, end, text, hook_words):
     duration = max(1, end - start)
     word_count = len(text.split())
     pace = word_count / duration
-
     text_lower = text.lower()
     hook_score = sum(1 for w in hook_words if w in text_lower)
-
     length_score = 1.0 - abs(duration - 27) / 40
-
     score = round((pace * 10) + (hook_score * 8) + (length_score * 15), 1)
-
     return {
         "start": round(start, 1),
         "end": round(end, 1),
