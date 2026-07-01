@@ -78,7 +78,7 @@ def upload_file(job_id, file_path):
 # ============== CLIP EXPORT ==============
 
 @celery_app.task(name="tasks.process_upload")
-def process_upload(job_id, file_b64, clip_start=0, clip_end=0, captions=False):
+def process_upload(job_id, file_b64, clip_start=0, clip_end=0, captions=False, edited_words=None):
     print("EXPORT START", job_id, "captions=", captions, flush=True)
     try:
         publish(job_id, {"status": "processing", "progress": 30})
@@ -97,13 +97,17 @@ def process_upload(job_id, file_b64, clip_start=0, clip_end=0, captions=False):
         srt_path = None
         if captions:
             publish(job_id, {"status": "processing", "progress": 60, "message": "Generating captions..."})
-            print("CAPTIONS: calling OpenAI Whisper API", flush=True)
-            audio_path = out_dir + "/clip_audio.wav"
-            run_cmd(["ffmpeg", "-y", "-i", trimmed_path, "-ar", "16000", "-ac", "1", audio_path])
-            words, segments = transcribe_audio(audio_path)
+            if edited_words:
+                # Use the user-edited words from frontend
+                words = edited_words
+                print("CAPTIONS: using edited words from frontend", len(words), flush=True)
+            else:
+                print("CAPTIONS: calling OpenAI Whisper API", flush=True)
+                audio_path = out_dir + "/clip_audio.wav"
+                run_cmd(["ffmpeg", "-y", "-i", trimmed_path, "-ar", "16000", "-ac", "1", audio_path])
+                words, segments = transcribe_audio(audio_path)
+                print("CAPTIONS DONE, words:", len(words), flush=True)
             srt_path = build_word_srt(out_dir, words)
-            print("CAPTIONS DONE, words:", len(words), flush=True)
-            # Store word timestamps in Redis so the frontend can display/edit them
             publish(job_id, {
                 "status": "processing", "progress": 70,
                 "words": words,
@@ -151,18 +155,24 @@ def trim_clip(job_id, video_path, clip_start, clip_end):
     return trimmed_path
 
 
-def build_word_srt(out_dir, words):
-    """Build an SRT with one word per entry for word-by-word caption display."""
+def build_word_srt(out_dir, words, group_size=3):
+    """Build an SRT with group_size words per entry for natural caption display."""
     if not words:
         return None
     srt_path = out_dir + "/captions.srt"
+    # Group words into chunks of group_size
+    groups = []
+    for i in range(0, len(words), group_size):
+        chunk = words[i:i+group_size]
+        text = " ".join(w.get("word","").strip() for w in chunk if w.get("word","").strip())
+        if not text:
+            continue
+        start = chunk[0].get("start", 0)
+        end = chunk[-1].get("end", start + 0.8)
+        groups.append({"text": text, "start": start, "end": end})
     with open(srt_path, "w") as f:
-        for i, w in enumerate(words, start=1):
-            start = format_srt_time(w.get("start", 0))
-            end = format_srt_time(w.get("end", w.get("start", 0) + 0.4))
-            text = w.get("word", "").strip()
-            if text:
-                f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
+        for i, g in enumerate(groups, start=1):
+            f.write(f"{i}\n{format_srt_time(g['start'])} --> {format_srt_time(g['end'])}\n{g['text']}\n\n")
     return srt_path
 
 
