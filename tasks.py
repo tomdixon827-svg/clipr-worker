@@ -183,9 +183,12 @@ def render_final(job_id, trimmed_path, srt_path):
     output_path = out_dir + "/output.mp4"
     vf_parts = ["crop=ih*9/16:ih", "scale=1080:1920"]
     if srt_path:
+        # Copy SRT to /tmp with a simple name to avoid colon issues in ffmpeg filter paths
+        safe_srt = "/tmp/captions_" + job_id.replace("-", "") + ".srt"
+        import shutil
+        shutil.copy(srt_path, safe_srt)
         style = "FontName=Arial,FontSize=28,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=1,Alignment=2,MarginV=600"
-        escaped_path = srt_path.replace(":", "\\:")
-        vf_parts.append(f"subtitles={escaped_path}:force_style='{style}'")
+        vf_parts.append(f"subtitles={safe_srt}:force_style='{style}'")
     vf = ",".join(vf_parts)
     cmd = [
         "ffmpeg", "-y",
