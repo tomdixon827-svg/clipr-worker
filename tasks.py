@@ -55,9 +55,11 @@ def transcribe_audio(audio_path):
     with urllib.request.urlopen(req, timeout=120) as resp:
         result = json.loads(resp.read())
 
-    # Return word-level entries with start/end times
     words = result.get('words', [])
     segments = result.get('segments', [])
+    print("TRANSCRIBE: words=", len(words), "segments=", len(segments), flush=True)
+    if segments:
+        print("TRANSCRIBE: first segment text:", segments[0].get('text','')[:60], flush=True)
     return words, segments
 
 def upload_file(job_id, file_path):
@@ -79,7 +81,7 @@ def upload_file(job_id, file_path):
 
 @celery_app.task(name="tasks.process_upload")
 def process_upload(job_id, file_b64, clip_start=0, clip_end=0, captions=False, edited_words=None):
-    print("EXPORT START", job_id, "captions=", captions, flush=True)
+    print("EXPORT START", job_id, "captions=", captions, "edited_words=", bool(edited_words), flush=True)
     try:
         publish(job_id, {"status": "processing", "progress": 30})
         out_dir = "/tmp/" + job_id
@@ -98,21 +100,16 @@ def process_upload(job_id, file_b64, clip_start=0, clip_end=0, captions=False, e
         if captions:
             publish(job_id, {"status": "processing", "progress": 60, "message": "Generating captions..."})
             if edited_words:
-                # Use the user-edited words from frontend
                 words = edited_words
-                print("CAPTIONS: using edited words from frontend", len(words), flush=True)
+                print("CAPTIONS: using edited words from frontend, count=", len(words), flush=True)
             else:
                 print("CAPTIONS: calling OpenAI Whisper API", flush=True)
                 audio_path = out_dir + "/clip_audio.wav"
                 run_cmd(["ffmpeg", "-y", "-i", trimmed_path, "-ar", "16000", "-ac", "1", audio_path])
-                words, segments = transcribe_audio(audio_path)
-                print("CAPTIONS DONE, words:", len(words), flush=True)
+                words, _ = transcribe_audio(audio_path)
+                print("CAPTIONS: transcribed words=", len(words), flush=True)
             srt_path = build_word_srt(out_dir, words)
-            publish(job_id, {
-                "status": "processing", "progress": 70,
-                "words": words,
-                "message": "Rendering..."
-            })
+            publish(job_id, {"status": "processing", "progress": 70, "words": words, "message": "Rendering..."})
 
         publish(job_id, {"status": "processing", "progress": 75})
         output_path = render_final(job_id, trimmed_path, srt_path)
@@ -121,11 +118,7 @@ def process_upload(job_id, file_b64, clip_start=0, clip_end=0, captions=False, e
         publish(job_id, {"status": "uploading", "progress": 90})
         download_url = upload_file(job_id, output_path)
         print("UPLOADED:", download_url, flush=True)
-        publish(job_id, {
-            "status": "complete", "progress": 100,
-            "download_url": download_url,
-            "words": words
-        })
+        publish(job_id, {"status": "complete", "progress": 100, "download_url": download_url, "words": words})
     except Exception as e:
         print("EXPORT ERROR:", str(e), flush=True)
         publish(job_id, {"status": "failed", "error": str(e), "progress": 0})
@@ -156,15 +149,14 @@ def trim_clip(job_id, video_path, clip_start, clip_end):
 
 
 def build_word_srt(out_dir, words, group_size=3):
-    """Build an SRT with group_size words per entry for natural caption display."""
+    """Build SRT with group_size words per entry — clean non-overlapping chunks."""
     if not words:
         return None
     srt_path = out_dir + "/captions.srt"
-    # Group words into chunks of group_size
     groups = []
     for i in range(0, len(words), group_size):
         chunk = words[i:i+group_size]
-        text = " ".join(w.get("word","").strip() for w in chunk if w.get("word","").strip())
+        text = " ".join(w.get("word", "").strip() for w in chunk if w.get("word", "").strip())
         if not text:
             continue
         start = chunk[0].get("start", 0)
@@ -189,7 +181,6 @@ def render_final(job_id, trimmed_path, srt_path):
     output_path = out_dir + "/output.mp4"
     vf_parts = ["crop=ih*9/16:ih", "scale=1080:1920"]
     if srt_path:
-        # Bold white text, black outline, positioned 2/3 down (MarginV from bottom)
         style = "FontName=Arial,FontSize=28,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=1,Alignment=2,MarginV=600"
         escaped_path = srt_path.replace(":", "\\:")
         vf_parts.append(f"subtitles={escaped_path}:force_style='{style}'")
@@ -225,12 +216,18 @@ def analyze_video(job_id, file_b64):
         publish_analysis(job_id, {"status": "processing", "message": "Transcribing speech..."})
         words, segments = transcribe_audio(audio_path)
 
+        print("ANALYZE: words=", len(words), "segments=", len(segments), flush=True)
+        if segments:
+            print("ANALYZE: first segment:", segments[0].get('text', '')[:80], flush=True)
+
         if not segments:
+            print("ANALYZE: no segments returned — publishing empty highlights", flush=True)
             publish_analysis(job_id, {"status": "complete", "highlights": []})
             return
 
         publish_analysis(job_id, {"status": "processing", "message": "Scoring moments..."})
         candidates = build_candidates(segments)
+        print("ANALYZE: candidates=", len(candidates), flush=True)
         candidates.sort(key=lambda c: c["score"], reverse=True)
         top = candidates[:4]
         top.sort(key=lambda c: c["start"])
@@ -238,6 +235,7 @@ def analyze_video(job_id, file_b64):
         publish_analysis(job_id, {"status": "complete", "highlights": top})
 
     except Exception as e:
+        print("ANALYZE ERROR:", str(e), flush=True)
         publish_analysis(job_id, {"status": "failed", "error": str(e)})
 
 
